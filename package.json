@@ -1,6 +1,6 @@
 {
-  "name": "bluemoon-voice",
-  "version": "0.1.0",
+  "name": "bluemoon-calls",
+  "version": "0.2.0",
   "private": true,
   "type": "module",
   "engines": {
@@ -11,6 +11,6 @@
     "check": "node --check server.mjs"
   },
   "dependencies": {
-    "ws": "8.22.0"
+    "livekit-server-sdk": "2.19.2"
   }
 }
