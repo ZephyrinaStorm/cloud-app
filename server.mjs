@@ -199,10 +199,9 @@ const server = http.createServer(async (req, res) => {
     token.addGrant({
       roomJoin: true,
       room: roomName,
-      canSubscribe: true,
-      canPublish: true,
-      canPublishData: true,
-      roomAdmin: false
+     canSubscribe: false,
+canPublish: false,
+canPublishData: true,
     });
 
     const participantToken = await token.toJwt();
