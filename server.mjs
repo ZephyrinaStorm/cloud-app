@@ -1,258 +1,236 @@
 import http from "node:http";
-import { randomUUID } from "node:crypto";
-import { WebSocketServer, WebSocket } from "ws";
+import { AccessToken } from "livekit-server-sdk";
 
 const {
+  PORT = "10000",
+  ALLOWED_ORIGIN = "https://dragojsgames.com",
   SUPABASE_URL,
   SUPABASE_PUBLISHABLE_KEY,
-  ALLOWED_ORIGIN = "https://dragojsgames.com",
-  PORT = "10000"
+  LIVEKIT_URL,
+  LIVEKIT_API_KEY,
+  LIVEKIT_API_SECRET,
+  ALLOWED_USER_IDS = ""
 } = process.env;
 
 if (!SUPABASE_URL || !SUPABASE_PUBLISHABLE_KEY) {
   throw new Error("Missing Supabase configuration");
 }
 
-const peers = new Map();
-const MAX_MEMBERS = 6;
-const MAX_CONNECTIONS = 40;
+// Restrict initial testing to explicitly approved Supabase user IDs.
+// These IDs are NOT passwords or Google client IDs.
+const allowedUsers = new Set(
+  ALLOWED_USER_IDS.split(",").map(id => id.trim()).filter(Boolean)
+);
 
-function send(ws, message) {
-  if (ws.readyState === WebSocket.OPEN) {
-    ws.send(JSON.stringify(message));
+const roomName = "bluemoon-lounge";
+const rateLimits = new Map();
+
+function livekitConfigured() {
+  try {
+    return (
+      new URL(LIVEKIT_URL).protocol === "wss:" &&
+      Boolean(LIVEKIT_API_KEY && LIVEKIT_API_SECRET)
+    );
+  } catch {
+    return false;
   }
 }
 
-function broadcast(message) {
-  for (const peer of peers.values()) {
-    send(peer.ws, message);
+function respond(res, status, body, corsAllowed = false) {
+  const headers = {
+    "Content-Type": "application/json; charset=utf-8",
+    "Cache-Control": "no-store",
+    "X-Content-Type-Options": "nosniff",
+    "Vary": "Origin"
+  };
+
+  if (corsAllowed) {
+    headers["Access-Control-Allow-Origin"] = ALLOWED_ORIGIN;
   }
+
+  res.writeHead(status, headers);
+  res.end(JSON.stringify(body));
 }
 
-const server = http.createServer((req, res) => {
-  if (req.method === "GET" && req.url === "/health") {
-    res.writeHead(200, {
-      "Content-Type": "application/json",
-      "Cache-Control": "no-store"
+function allowTokenRequest(userId) {
+  const now = Date.now();
+  let entry = rateLimits.get(userId);
+
+  if (!entry || now >= entry.resetAt) {
+    entry = { count: 0, resetAt: now + 60000 };
+    rateLimits.set(userId, entry);
+  }
+
+  entry.count += 1;
+  return entry.count <= 10;
+}
+
+const cleanupTimer = setInterval(() => {
+  const now = Date.now();
+  for (const [id, entry] of rateLimits) {
+    if (entry.resetAt <= now) rateLimits.delete(id);
+  }
+}, 60000);
+
+cleanupTimer.unref();
+
+const server = http.createServer(async (req, res) => {
+  const path = (req.url || "").split("?")[0];
+  const originAllowed = req.headers.origin === ALLOWED_ORIGIN;
+
+  if (req.method === "GET" && path === "/health") {
+    respond(res, 200, {
+      ok: true,
+      service: "BlueMoon LiveKit token service",
+      livekitConfigured: livekitConfigured(),
+      testAccessConfigured: allowedUsers.size > 0
+    });
+    return;
+  }
+
+  if (path !== "/api/livekit/token") {
+    respond(res, 404, { error: "Not found" });
+    return;
+  }
+
+  if (!originAllowed) {
+    respond(res, 403, { error: "Origin not allowed" });
+    return;
+  }
+
+  if (req.method === "OPTIONS") {
+    res.writeHead(204, {
+      "Access-Control-Allow-Origin": ALLOWED_ORIGIN,
+      "Access-Control-Allow-Methods": "POST, OPTIONS",
+      "Access-Control-Allow-Headers": "Authorization, Content-Type",
+      "Access-Control-Max-Age": "600",
+      "Vary": "Origin"
+    });
+    res.end();
+    return;
+  }
+
+  if (req.method !== "POST") {
+    respond(res, 405, { error: "Use POST" }, true);
+    return;
+  }
+
+  if (!livekitConfigured()) {
+    respond(res, 503, {
+      error: "LiveKit is not configured"
+    }, true);
+    return;
+  }
+
+  if (allowedUsers.size === 0) {
+    respond(res, 503, {
+      error: "Test access has not been configured"
+    }, true);
+    return;
+  }
+
+  const authorization = req.headers.authorization || "";
+
+  if (
+    !authorization.startsWith("Bearer ") ||
+    authorization.length > 8192
+  ) {
+    respond(res, 401, { error: "Sign in required" }, true);
+    return;
+  }
+
+  try {
+    // Verify the session with Supabase, not by trusting browser data.
+    const authResponse = await fetch(
+      `${SUPABASE_URL.replace(/\/$/, "")}/auth/v1/user`,
+      {
+        headers: {
+          apikey: SUPABASE_PUBLISHABLE_KEY,
+          Authorization: authorization
+        },
+        signal: AbortSignal.timeout(8000)
+      }
+    );
+
+    if (!authResponse.ok) {
+      respond(
+        res,
+        authResponse.status >= 500 ? 503 : 401,
+        { error: "Unable to verify your session" },
+        true
+      );
+      return;
+    }
+
+    const user = await authResponse.json();
+
+    if (!user.id) {
+      respond(res, 401, { error: "Invalid session" }, true);
+      return;
+    }
+
+    if (!allowedUsers.has(user.id)) {
+      respond(res, 403, {
+        error: "This account is not approved for the calls test"
+      }, true);
+      return;
+    }
+
+    if (!allowTokenRequest(user.id)) {
+      respond(res, 429, {
+        error: "Too many requests. Please wait a minute."
+      }, true);
+      return;
+    }
+
+    // Opaque identity: do not put email addresses in LiveKit identities.
+    const token = new AccessToken(
+      LIVEKIT_API_KEY,
+      LIVEKIT_API_SECRET,
+      {
+        identity: user.id,
+        name: `Member ${user.id.slice(0, 6)}`,
+        ttl: "5m"
+      }
+    );
+
+    // Room and permissions are chosen by the server.
+    // No administrative or recording permissions are granted.
+    token.addGrant({
+      roomJoin: true,
+      room: roomName,
+      canSubscribe: true,
+      canPublish: true,
+      canPublishData: true,
+      roomAdmin: false
     });
 
-    res.end(JSON.stringify({
-      ok: true,
-      service: "BlueMoon Voice signaling",
-      members: peers.size,
-      voiceRelayConfigured: false
-    }));
-    return;
+    const participantToken = await token.toJwt();
+
+    respond(res, 200, {
+      serverUrl: LIVEKIT_URL,
+      participantToken,
+      roomName
+    }, true);
+  } catch {
+    // Never log session tokens, API secrets or generated room tokens.
+    console.error("BlueMoon token request failed");
+    respond(res, 503, {
+      error: "Calling service temporarily unavailable"
+    }, true);
   }
-
-  res.writeHead(404);
-  res.end("Not found");
 });
 
-const wss = new WebSocketServer({
-  noServer: true,
-  maxPayload: 32768,
-  perMessageDeflate: false
-});
-
-server.on("upgrade", (req, socket, head) => {
-  if (
-    req.url !== "/voice" ||
-    req.headers.origin !== ALLOWED_ORIGIN ||
-    wss.clients.size >= MAX_CONNECTIONS
-  ) {
-    socket.destroy();
-    return;
-  }
-
-  wss.handleUpgrade(req, socket, head, ws => {
-    wss.emit("connection", ws);
-  });
-});
-
-wss.on("connection", ws => {
-  const id = randomUUID();
-  let authenticated = false;
-  let authenticating = false;
-  let joined = false;
-  let alive = true;
-  let messageCount = 0;
-  let windowStart = Date.now();
-  let sessionTimer;
-
-  const authTimer = setTimeout(() => {
-    ws.close(4001, "Authentication required");
-  }, 10000);
-
-  function cleanup() {
-    clearTimeout(authTimer);
-    clearTimeout(sessionTimer);
-
-    if (joined) {
-      joined = false;
-      peers.delete(id);
-      broadcast({ type: "left", id });
-    }
-  }
-
-  ws.on("pong", () => {
-    alive = true;
-  });
-
-  const heartbeat = setInterval(() => {
-    if (!alive) {
-      ws.terminate();
-      return;
-    }
-    alive = false;
-    ws.ping();
-  }, 30000);
-
-  ws.on("close", () => {
-    clearInterval(heartbeat);
-    cleanup();
-  });
-
-  ws.on("error", () => {
-    ws.terminate();
-  });
-
-  ws.on("message", async raw => {
-    if (Date.now() - windowStart >= 10000) {
-      windowStart = Date.now();
-      messageCount = 0;
-    }
-
-    if (++messageCount > 120) {
-      ws.close(4008, "Rate limit exceeded");
-      return;
-    }
-
-    let message;
-    try {
-      message = JSON.parse(raw.toString());
-    } catch {
-      ws.close(4000, "Invalid message");
-      return;
-    }
-
-    if (!message || typeof message !== "object") {
-      ws.close(4000, "Invalid message");
-      return;
-    }
-
-    if (!authenticated) {
-      if (
-        authenticating ||
-        message.type !== "auth" ||
-        typeof message.token !== "string" ||
-        message.token.length > 8192
-      ) {
-        ws.close(4001, "Authentication required");
-        return;
-      }
-
-      authenticating = true;
-
-      try {
-        const response = await fetch(
-          `${SUPABASE_URL.replace(/\/$/, "")}/auth/v1/user`,
-          {
-            headers: {
-              apikey: SUPABASE_PUBLISHABLE_KEY,
-              Authorization: `Bearer ${message.token}`
-            },
-            signal: AbortSignal.timeout(8000)
-          }
-        );
-
-        if (!response.ok) throw new Error("Invalid session");
-
-        const user = await response.json();
-        if (!user.id) throw new Error("Invalid user");
-
-        if (ws.readyState !== WebSocket.OPEN) return;
-
-        if (peers.size >= MAX_MEMBERS) {
-          ws.close(4010, "Room full");
-          return;
-        }
-
-        if ([...peers.values()].some(p => p.userId === user.id)) {
-          ws.close(4009, "Already connected");
-          return;
-        }
-
-        const name = String(
-          user.user_metadata?.full_name || "BlueMoon member"
-        ).slice(0, 60);
-
-        const existingPeers = [...peers].map(([peerId, peer]) => ({
-          id: peerId,
-          name: peer.name
-        }));
-
-        authenticated = true;
-        joined = true;
-        clearTimeout(authTimer);
-
-        peers.set(id, { ws, userId: user.id, name });
-
-        send(ws, {
-          type: "welcome",
-          id,
-          peers: existingPeers,
-          iceServers: [],
-          relayConfigured: false
-        });
-
-        broadcast({ type: "joined", id, name });
-
-        // Require fresh authentication periodically.
-        sessionTimer = setTimeout(() => {
-          ws.close(4001, "Please reconnect to renew your session");
-        }, 15 * 60 * 1000);
-      } catch {
-        ws.close(4001, "Authentication failed");
-      }
-
-      return;
-    }
-
-    if (message.type === "leave") {
-      ws.close(1000, "Left room");
-      return;
-    }
-
-    if (message.type === "signal") {
-      if (
-        typeof message.to !== "string" ||
-        message.to === id ||
-        !message.data ||
-        typeof message.data !== "object"
-      ) return;
-
-      const target = peers.get(message.to);
-      if (!target) return;
-
-      send(target.ws, {
-        type: "signal",
-        from: id,
-        data: message.data
-      });
-    }
-  });
-});
+server.requestTimeout = 15000;
+server.headersTimeout = 10000;
+server.maxHeadersCount = 40;
 
 server.listen(Number(PORT), "0.0.0.0", () => {
-  console.log("BlueMoon Voice signaling started");
+  console.log("BlueMoon LiveKit token service started");
 });
 
 process.on("SIGTERM", () => {
-  for (const ws of wss.clients) {
-    ws.close(1012, "Service restarting");
-  }
-
+  clearInterval(cleanupTimer);
   server.close(() => process.exit(0));
   setTimeout(() => process.exit(0), 5000).unref();
 });
